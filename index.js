@@ -4,20 +4,28 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// तपाईंको सही विवरणहरू
-const FIREBASE_DB_URL = "https://cash-jitau-default-rtdb.firebaseio.com/users";
-const POSTBACK_SECRET_KEY = "e4574240c62e6c2db436ca744c949e"; // तपाईंले दिनुभएको नयाँ Key
+const FIREBASE_DB_URL = "https://cash-jitau-default-rtdb.firebaseio.com";
+const POSTBACK_SECRET_KEY = "e4574240c62e6c2db436ca744c949e";
 
 app.get('/postback', async (req, res) => {
     try {
-        const { user_id, reward, transaction_id, signature } = req.query;
+        const { 
+            user_id, 
+            reward, 
+            transaction_id, 
+            signature,
+            offer_name,
+            offer_id,
+            task_name,
+            task_id
+        } = req.query;
 
-        // १. पारामिटरहरू चेक गर्ने
+        // 🔹 1. Required check
         if (!user_id || !reward || !transaction_id || !signature) {
-            return res.status(400).send("विवरण अपूर्ण छ");
+            return res.status(400).send("Missing data");
         }
 
-        // २. आधिकारिक डकुमेन्ट अनुसार Signature तयार पार्ने
+        // 🔹 2. Signature verify
         const rewardTruncated = Math.trunc(Number(reward));
         const template = `${POSTBACK_SECRET_KEY}.${user_id}.${rewardTruncated}.${transaction_id}`;
         
@@ -26,40 +34,72 @@ app.get('/postback', async (req, res) => {
             .update(template)
             .digest('hex');
 
-        // ३. सुरक्षा जाँच (Signature Verification)
         if (signature.toLowerCase() !== expectedSignature.toLowerCase()) {
-            console.log("चेतावनी: गलत सिग्नेचर! अवैध रिक्वेस्ट।");
-            return res.status(403).send("अवैध रिक्वेस्ट।");
+            console.log("Invalid signature");
+            return res.status(403).send("Invalid request");
         }
 
-        // ४. Firebase बाट युजरको डाटा तान्ने
-        const getUserResponse = await fetch(`${FIREBASE_DB_URL}/${user_id}.json`);
-        const userData = await getUserResponse.json();
-        
+        // 🔥 3. Duplicate रोक (transaction_id)
+        const checkTx = await fetch(`${FIREBASE_DB_URL}/transactions/${transaction_id}.json`);
+        const txExists = await checkTx.json();
+
+        if (txExists) {
+            console.log("Duplicate transaction ignored");
+            return res.status(200).send("Duplicate");
+        }
+
+        // 🔹 4. User data fetch
+        const userRes = await fetch(`${FIREBASE_DB_URL}/users/${user_id}.json`);
+        const userData = await userRes.json();
+
         if (!userData) {
-            console.log(`युजर ${user_id} डाटाबेसमा फेला परेन।`);
             return res.status(404).send("User not found");
         }
 
-        // ५. डाटाबेसको 'balance' मा रिवार्ड थप्ने
-        const currentBalance = Number(userData.balance || 0);
+        const currentBalance = Number(userData.balance || userData.coins || 0);
         const newBalance = currentBalance + Number(reward);
 
-        // ६. Firebase मा नयाँ ब्यालेन्स अपडेट गर्ने
-        await fetch(`${FIREBASE_DB_URL}/${user_id}.json`, {
+        // 🔹 5. Update balance
+        await fetch(`${FIREBASE_DB_URL}/users/${user_id}.json`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
-                balance: newBalance
+                balance: newBalance,
+                coins: newBalance
             })
         });
 
-        console.log(`सफलतापूर्वक युजर ${user_id} को नयाँ ब्यालेन्स ${newBalance} भयो।`);
+        // 🔥 6. History save (MAIN FEATURE)
+        const historyData = {
+            user_id,
+            coins: Number(reward),
+            offer_name: offer_name || "Unknown Game",
+            task_name: task_name || "Task",
+            offer_id: offer_id || null,
+            task_id: task_id || null,
+            transaction_id,
+            timestamp: Date.now()
+        };
+
+        await fetch(`${FIREBASE_DB_URL}/history/${user_id}.json`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(historyData)
+        });
+
+        // 🔹 7. Save transaction (duplicate रोक्न)
+        await fetch(`${FIREBASE_DB_URL}/transactions/${transaction_id}.json`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ used: true })
+        });
+
+        console.log(`User ${user_id} earned ${reward} from ${offer_name}`);
         return res.status(200).send("OK");
 
     } catch (error) {
-        console.error("सर्भरमा समस्या आयो:", error);
-        return res.status(500).send("Database Error");
+        console.error("Server Error:", error);
+        return res.status(500).send("Server Error");
     }
 });
 
