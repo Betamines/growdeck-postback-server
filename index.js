@@ -1,5 +1,6 @@
 const express = require('express');
 const crypto = require('crypto');
+const axios = require('axios'); // Use axios for easier requests
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,90 +16,56 @@ app.get('/postback', async (req, res) => {
             transaction_id, 
             signature,
             offer_name,
-            offer_id,
-            task_name,
-            task_id
+            task_name
         } = req.query;
 
-        // 🔹 1. Required check
         if (!user_id || !reward || !transaction_id || !signature) {
-            return res.status(400).send("Missing data");
+            return res.status(400).send("Missing required data");
         }
 
-        // 🔹 2. Signature verify
+        // 1. Verify Signature
         const rewardTruncated = Math.trunc(Number(reward));
         const template = `${POSTBACK_SECRET_KEY}.${user_id}.${rewardTruncated}.${transaction_id}`;
-        
-        const expectedSignature = crypto
-            .createHmac('sha256', POSTBACK_SECRET_KEY)
-            .update(template)
-            .digest('hex');
+        const expectedSignature = crypto.createHmac('sha256', POSTBACK_SECRET_KEY).update(template).digest('hex');
 
         if (signature.toLowerCase() !== expectedSignature.toLowerCase()) {
-            console.log("Invalid signature");
-            return res.status(403).send("Invalid request");
+            return res.status(403).send("Invalid Signature");
         }
 
-        // 🔥 3. Duplicate रोक (transaction_id)
-        const checkTx = await fetch(`${FIREBASE_DB_URL}/transactions/${transaction_id}.json`);
-        const txExists = await checkTx.json();
+        // 2. Prevent Duplicate Credits
+        const checkTx = await axios.get(`${FIREBASE_DB_URL}/processed_transactions/${transaction_id}.json`);
+        if (checkTx.data) return res.status(200).send("Duplicate Transaction");
 
-        if (txExists) {
-            console.log("Duplicate transaction ignored");
-            return res.status(200).send("Duplicate");
-        }
+        // 3. Update User Balance (coins & balance)
+        const userRes = await axios.get(`${FIREBASE_DB_URL}/users/${user_id}.json`);
+        if (!userRes.data) return res.status(404).send("User Not Found");
 
-        // 🔹 4. User data fetch
-        const userRes = await fetch(`${FIREBASE_DB_URL}/users/${user_id}.json`);
-        const userData = await userRes.json();
-
-        if (!userData) {
-            return res.status(404).send("User not found");
-        }
-
-        const currentBalance = Number(userData.balance || userData.coins || 0);
+        const currentBalance = Number(userRes.data.balance || userRes.data.coins || 0);
         const newBalance = currentBalance + Number(reward);
 
-        // 🔹 5. Update balance
-        await fetch(`${FIREBASE_DB_URL}/users/${user_id}.json`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                balance: newBalance,
-                coins: newBalance
-            })
+        await axios.patch(`${FIREBASE_DB_URL}/users/${user_id}.json`, { 
+            balance: newBalance,
+            coins: newBalance
         });
 
-        // 🔥 6. History save (MAIN FEATURE)
+        // 4. Save to History (This triggers the Android Notification I implemented)
         const historyData = {
             user_id,
             coins: Number(reward),
-            offer_name: offer_name || "Unknown Game",
-            task_name: task_name || "Task",
-            offer_id: offer_id || null,
-            task_id: task_id || null,
+            offer_name: offer_name || "Game",
+            task_name: task_name || "Offerwall",
             transaction_id,
             timestamp: Date.now()
         };
 
-        await fetch(`${FIREBASE_DB_URL}/history/${user_id}.json`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(historyData)
-        });
+        await axios.post(`${FIREBASE_DB_URL}/history/${user_id}.json`, historyData);
 
-        // 🔹 7. Save transaction (duplicate रोक्न)
-        await fetch(`${FIREBASE_DB_URL}/transactions/${transaction_id}.json`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ used: true })
-        });
+        // 5. Mark Transaction as Processed
+        await axios.put(`${FIREBASE_DB_URL}/processed_transactions/${transaction_id}.json`, { processed: true });
 
-        console.log(`User ${user_id} earned ${reward} from ${offer_name}`);
         return res.status(200).send("OK");
-
     } catch (error) {
-        console.error("Server Error:", error);
+        console.error("Postback Error:", error.message);
         return res.status(500).send("Server Error");
     }
 });
